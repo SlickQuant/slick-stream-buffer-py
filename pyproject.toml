@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slick-stream-buffer-py"
+dynamic = ["version"]
+description = "Lock-free SPMC byte stream buffer with C++ interoperability via shared memory"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Slick Quant", email = "slickquant@slickquant.com"}
+]
+keywords = ["stream-buffer", "lock-free", "atomic", "shared-memory", "ipc", "multiprocessing", "spmc"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/SlickQuant/slick-stream-buffer-py"
+Documentation = "https://github.com/SlickQuant/slick-stream-buffer-py#readme"
+Repository = "https://github.com/SlickQuant/slick-stream-buffer-py"
+"Bug Tracker" = "https://github.com/SlickQuant/slick-stream-buffer-py/issues"
+
+[tool.setuptools]
+py-modules = ["slick_stream_buffer_py", "ssb_atomic_ops"]
+
+[tool.setuptools.dynamic]
+version = {attr = "slick_stream_buffer_py.__version__"}
+
+[tool.cibuildwheel]
+# Build for CPython 3.8-3.14
+build = "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+# Skip musllinux builds (only build manylinux for Linux)
+skip = "*-musllinux_*"
+
+# Test the wheels after building
+test-command = "python -c \"import slick_stream_buffer_py; import ssb_atomic_ops; print('Import successful')\""
+test-requires = []
+
+# Build settings
+build-verbosity = 1
+
+# Platform-specific settings
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+# Use manylinux2014 for compatibility (RHEL 7+, Ubuntu 14.04+, Debian 8+)
+manylinux-x86_64-image = "manylinux2014"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
+[tool.cibuildwheel.macos]
+archs = ["universal2"]

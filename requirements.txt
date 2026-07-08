@@ -1,0 +1,2 @@
+# No runtime dependencies (Python 3.8+ standard library only)
+# multiprocessing.shared_memory is included in Python 3.8+

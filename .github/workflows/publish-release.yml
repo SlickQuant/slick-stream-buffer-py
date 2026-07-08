@@ -1,0 +1,99 @@
+name: Publish Release (PyPI)
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  # Build source distribution (sdist) - only once, platform-independent
+  build-sdist:
+    name: Build Source Distribution
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install build dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build wheel setuptools
+
+    - name: Build source distribution only
+      run: python -m build --sdist
+
+    - name: Upload sdist artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: pypi-sdist
+        path: dist/*.tar.gz
+        retention-days: 7
+
+  # Build binary wheels for each platform/Python version
+  build-wheels:
+    name: Build Wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v2.22
+      # Configuration is in pyproject.toml under [tool.cibuildwheel]
+
+    - name: Upload wheel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: pypi-wheel-${{ matrix.os }}
+        path: wheelhouse/*.whl
+        retention-days: 7
+
+  # Publish to PyPI
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-sdist, build-wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+    - name: Download all PyPI artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: pypi-*
+        merge-multiple: true
+        path: dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
+
+  # Create release summary
+  release-summary:
+    name: Release Summary
+    needs: [publish-pypi]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+    - name: Create summary
+      run: |
+        echo "## 🎉 Release Published!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Installation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Via pip (PyPI):**" >> $GITHUB_STEP_SUMMARY
+        echo '```bash' >> $GITHUB_STEP_SUMMARY
+        echo "pip install slick-stream-buffer-py" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Links" >> $GITHUB_STEP_SUMMARY
+        echo "- PyPI: https://pypi.org/project/slick-stream-buffer-py/" >> $GITHUB_STEP_SUMMARY
