@@ -1,7 +1,7 @@
 """
 slick-stream-buffer-py: A lock-free single-producer multi-consumer byte stream
 buffer with shared memory support, binary-compatible with the C++
-slick::SlickStreamBuffer (slick/stream_buffer.hpp v1.x, header magic 'SSB1').
+slick::SlickStreamBuffer (slick/stream_buffer.hpp v2.x, header magic 'SSB1').
 
 A Python producer/consumer and a C++ producer/consumer can communicate
 seamlessly through the same shared memory segment.
@@ -12,7 +12,8 @@ directly into the ring. consume(n) does not discard bytes - it PUBLISHES them
 to consumers as one discrete message record. Each consumer owns a monotonic
 cursor and reads whole messages as (bytes, length) pairs.
 
-Shared memory layout (matches stream_buffer.hpp:136-167 byte-for-byte):
+Shared memory layout (matches the layout comment in stream_buffer.hpp
+byte-for-byte):
 
     [HEADER: 64 bytes]
       Offset 0-7   (8 bytes):  std::atomic<uint64_t> committed_   - monotonic end of committed bytes
@@ -37,11 +38,19 @@ Caveats (same as C++):
   control ring or data ring size, the consumer skips ahead (see loss_count()).
 - prepare() may relocate the committed-but-unconsumed region; memoryviews
   previously returned by data() or prepare() are invalidated.
-- A single message (one consume() call) is limited to < 4 GiB.
+- A single message (one consume() call) is limited to < 4 GiB; consume()
+  raises ValueError rather than publishing a truncated record length.
+- read() takes a per-call configuration (see read_traits): reset detection is
+  on by default, loss counting is off, so loss_count() stays 0 unless asked
+  for. Records are still skipped correctly either way.
+- Only the process that actually creates a segment initializes it. Attaching
+  to a name another application owns never writes a byte; a segment left
+  wedged by a creator that died mid-initialization is cleared explicitly with
+  SlickStreamBuffer.remove(name).
 """
 from __future__ import annotations
 
-__version__ = '0.1.0'
+__version__ = '2.0.0'
 
 import sys
 import time
@@ -49,12 +58,12 @@ import struct
 import ctypes
 import inspect
 from multiprocessing.shared_memory import SharedMemory
-from typing import Optional, Tuple, Union
+from typing import Optional, Set, Tuple, Union
 
 from ssb_atomic_ops import AtomicUInt64, AtomicUInt32
 
 # ---------------------------------------------------------------------------
-# Layout constants (must match stream_buffer.hpp:155-167 exactly)
+# Layout constants (must match the C++ header's layout constants exactly)
 # ---------------------------------------------------------------------------
 HEADER_SIZE = 64
 COMMITTED_OFFSET = 0
@@ -83,10 +92,52 @@ U32_MAX = 0xFFFFFFFF
 # resource tracker's exit-time auto-unlink when merely attaching on POSIX.
 _SHM_SUPPORTS_TRACK = 'track' in inspect.signature(SharedMemory.__init__).parameters
 
+# Tracker-form ('/name') segments this process actually registered with
+# multiprocessing's resource tracker, and so is entitled to unregister. The
+# tracker services UNREGISTER with set.remove() on its own cache, so handing it
+# a name it never saw makes it raise KeyError and print an asynchronous
+# traceback from its own process - and merely sending the message starts that
+# process if it was not already running. Under the GIL set.add() and
+# set.remove() are atomic, so the registry needs no lock: exactly one caller
+# wins the name and does the retracting.
+_tracked_shm_names: Set[str] = set()
+
+
+def _note_shm_registration(shm: SharedMemory) -> None:
+    """Record that constructing ``shm`` registered its name with the resource
+    tracker, so a later unlink can retract exactly what we registered."""
+    if sys.platform != 'win32':
+        _tracked_shm_names.add(shm._name)
+
+
+def _retract_shm_registration(prefixed: str) -> None:
+    """Drop this process's resource-tracker registration for a segment that is
+    already unlinked, so exiting does not warn about cleaning up a name that is
+    gone.
+
+    Silent when this process never registered the name - the usual case for the
+    startup ``remove()`` call, where the segment belongs to a previous run and
+    telling the tracker about it would only make it raise.
+    """
+    try:
+        _tracked_shm_names.remove(prefixed)
+    except KeyError:
+        return  # never ours to retract - leave the tracker alone
+    try:
+        from multiprocessing import resource_tracker
+        resource_tracker.unregister(prefixed, "shared_memory")
+    except Exception:
+        pass
+
 
 def _is_power_of_two(value: int) -> bool:
-    """Matches C++ is_power_of_two (stream_buffer.hpp:169-171)."""
+    """Matches C++ is_power_of_two."""
     return value != 0 and (value & (value - 1)) == 0
+
+
+def _total_bytes(capacity: int, control_size: int) -> int:
+    """Bytes a segment of this geometry occupies (matches C++ total_bytes)."""
+    return HEADER_SIZE + RECORD_SIZE * control_size + capacity
 
 
 def _buffer_base_addr(buffer: memoryview) -> int:
@@ -95,9 +146,45 @@ def _buffer_base_addr(buffer: memoryview) -> int:
     return ctypes.addressof(buf_array)
 
 
+class read_traits:
+    """Per-call configuration for :meth:`SlickStreamBuffer.read`, mirroring
+    C++ ``slick::read_traits``.
+
+    Ordinary callers write ``buf.read(cursor)`` and never name a traits class.
+    Subclass to change a flag::
+
+        class counting(read_traits):
+            count_loss = True
+
+        data, length, cursor = buf.read(cursor, counting)
+
+    The configuration rides on ``read()`` rather than on the buffer, so every
+    configuration is still the same ``SlickStreamBuffer``.
+    """
+
+    #: Resynchronize a consumer whose cursor outlived a ``reset()`` that
+    #: restarted the numbering. On by default, as in C++.
+    detect_reset = True
+
+    #: Accumulate :meth:`SlickStreamBuffer.loss_count` as records are skipped.
+    #: Off by default, as in C++: records are still skipped correctly, only the
+    #: counter is silent. Turn it on when diagnosing loss.
+    count_loss = False
+
+
+class counting_read_traits(read_traits):
+    """``read_traits`` with loss counting on - the diagnostic configuration."""
+    count_loss = True
+
+
+#: PEP 8 spellings of the traits classes; the snake_case names match C++.
+ReadTraits = read_traits
+CountingReadTraits = counting_read_traits
+
+
 class PublishedRecord:
     """The published message record as consumers will see it, returned by
-    consume(). Mirrors C++ published_record (stream_buffer.hpp:180-185).
+    consume(). Mirrors C++ published_record.
 
     Evaluates to False when nothing was published (zero-length consume).
     Unlike C++, `data` is a bytes copy, not a pointer into the ring.
@@ -161,6 +248,9 @@ class SlickStreamBuffer:
 
         self.use_shm = name is not None
         self._shm: Optional[SharedMemory] = None
+        # Tracker-form name of the mapping. Outlives close(), which drops
+        # _shm, so unlink() still knows what to unlink - see unlink().
+        self._shm_name: Optional[str] = None
         self._local_buf: Optional[bytearray] = None
         self._buf: Optional[memoryview] = None
         self._own = False
@@ -171,12 +261,17 @@ class SlickStreamBuffer:
         self._control_mask = 0
         self._data_offset = 0
 
-        # producer-private state (single thread only)
+        # producer-private state (single thread only). The cursors shadow the
+        # shared atomics so publishing never re-loads a counter only the
+        # producer writes (matches the C++ *_cursor_ members).
         self._prepared_size = 0
         self._committed_cursor = 0
         self._consumed_cursor = 0
+        self._next_seq_cursor = 0
+        self._reserve_end_cursor = 0
 
-        # per-instance loss counter (mirrors C++ loss_count_; always enabled in Python)
+        # per-instance loss counter (mirrors C++ loss_count_); only accumulated
+        # for reads made with a traits whose count_loss is true
         self._loss_count = 0
 
         # atomic wrappers, built once the buffer exists
@@ -191,18 +286,25 @@ class SlickStreamBuffer:
             raise ValueError("capacity must be power of 2")
         if control_size is not None and not _is_power_of_two(int(control_size)):
             raise ValueError("control_size must be power of 2")
+        if capacity is not None and control_size is not None:
+            # A geometry whose total cannot be addressed must be rejected, not
+            # truncated into a tiny mapping that would then pass every later
+            # size check against its own wrapped value (C++ total_bytes()).
+            if _total_bytes(int(capacity), int(control_size)) > sys.maxsize:
+                raise ValueError(
+                    "capacity plus control ring exceeds the address space of this build")
 
         if self.use_shm:
             if capacity is not None or control_size is not None:
-                # Creator constructor (C++ stream_buffer.hpp:197-221 with shm_name)
+                # Creator constructor (C++ SlickStreamBuffer(capacity, control_size, name))
                 if capacity is None or control_size is None:
                     raise ValueError("capacity and control_size must both be provided when creating")
                 self._allocate_shm(int(capacity), int(control_size), open_only=False)
             else:
-                # Opener constructor (C++ stream_buffer.hpp:230-235)
+                # Opener constructor (C++ SlickStreamBuffer(name))
                 self._allocate_shm(None, None, open_only=True)
         else:
-            # Local memory mode (C++ stream_buffer.hpp:213-220)
+            # Local memory mode
             if capacity is None or control_size is None:
                 raise ValueError("capacity and control_size required for local memory mode")
             self._init_local(int(capacity), int(control_size))
@@ -231,8 +333,9 @@ class SlickStreamBuffer:
         ]
 
     def _write_header_and_control(self) -> None:
-        """Initialize header fields and control ring as the creator
-        (matches C++ stream_buffer.hpp:671-681)."""
+        """Initialize header fields and control ring as the creator.
+
+        Only ever called by the process that actually created the segment."""
         buf = self._buf
         # zero the four cursors
         struct.pack_into("<QQQQ", buf, COMMITTED_OFFSET, 0, 0, 0, 0)
@@ -269,86 +372,158 @@ class SlickStreamBuffer:
         exiting does not unlink a segment it does not own."""
         if _SHM_SUPPORTS_TRACK and sys.platform != 'win32':
             return SharedMemory(name=name, create=False, track=False)
-        return SharedMemory(name=name, create=False)
+        shm = SharedMemory(name=name, create=False)
+        _note_shm_registration(shm)  # older Python registers even on attach
+        return shm
+
+    def _adopt_shm(self, shm: SharedMemory) -> None:
+        """Take over a mapping: hold the object, map its bytes, and remember
+        its name. The name is kept separately because close() drops the object
+        while the segment itself lives on until something unlinks it."""
+        self._shm = shm
+        self._shm_name = shm._name
+        self._buf = shm.buf
 
     def _allocate_shm(self, capacity: Optional[int], control_size: Optional[int],
                       open_only: bool) -> None:
-        """Maps C++ allocate_shm_data (stream_buffer.hpp:612-696)."""
+        """Maps C++ allocate_shm_data.
+
+        Initialization authority is the OS-backed answer to "did this process
+        create the segment?", not a CAS on the in-band init-state slot: a
+        foreign segment that happens to share our name is zero-filled too, so a
+        CAS on it would win and overwrite bytes we do not own before the magic
+        is ever checked. ``SharedMemory(create=True)`` is exactly that answer -
+        ``O_CREAT|O_EXCL`` on POSIX, ``ERROR_ALREADY_EXISTS`` on Windows.
+        """
         if open_only:
             # Opener constructor - open existing only
-            self._shm = self._attach_shm(self.name)
-            self._buf = self._shm.buf
+            self._adopt_shm(self._attach_shm(self.name))
             self._a_init = AtomicUInt32(self._buf, INIT_STATE_OFFSET)
-            if not self._wait_ready():
-                self._release_shm_on_error()
-                raise RuntimeError("Timed out waiting for shared memory initialization")
+            self._require_mapped_size(HEADER_SIZE)
+            self._wait_for_ready()
             self._map_existing(expected_capacity=None, expected_control_size=None)
             return
 
         # Creator constructor - create or open (C++ open_or_create)
-        total = HEADER_SIZE + RECORD_SIZE * control_size + capacity
+        total = _total_bytes(capacity, control_size)
         try:
-            self._shm = SharedMemory(name=self.name, create=True, size=total)
+            shm = SharedMemory(name=self.name, create=True, size=total)
+            _note_shm_registration(shm)
+            created = True
         except FileExistsError:
-            self._shm = self._attach_shm(self.name)
-        self._buf = self._shm.buf
+            shm = self._attach_shm(self.name)
+            created = False
+        self._adopt_shm(shm)
         self._a_init = AtomicUInt32(self._buf, INIT_STATE_OFFSET)
 
-        # Atomically claim ownership: CAS init_state UNINITIALIZED -> INITIALIZING
-        # (matches C++ stream_buffer.hpp:663-665)
-        won, _ = self._a_init.compare_exchange(INIT_STATE_UNINITIALIZED, INIT_STATE_INITIALIZING)
-
-        if won:
-            # We are the creator - initialize (stream_buffer.hpp:667-683)
-            self._own = True
-            self._set_geometry(capacity, control_size)
-            self._write_header_and_control()
-            self._build_atomics()
-            self._a_init.store_release(INIT_STATE_READY)
-            self._committed_cursor = 0
-            self._consumed_cursor = 0
-        else:
-            # Segment already existed - wait and validate geometry
-            # (stream_buffer.hpp:685-694)
+        if not created:
+            # The segment pre-existed us - attach to it without touching a byte
+            # until _map_existing() has validated its magic, geometry and size.
             self._own = False
-            if not self._wait_ready():
-                self._release_shm_on_error()
-                raise RuntimeError("Timed out waiting for shared memory initialization")
+            self._require_mapped_size(HEADER_SIZE)
+            self._wait_for_ready()
             self._map_existing(expected_capacity=capacity, expected_control_size=control_size)
+            return
 
-    def _wait_ready(self) -> bool:
-        """Wait up to 2000ms for init_state == READY
-        (matches C++ wait_for_shared_memory_ready, stream_buffer.hpp:568-577)."""
-        for _ in range(2000):
+        # Initialize as creator
+        self._own = True
+        self._require_mapped_size(total)
+        won, _ = self._a_init.compare_exchange(INIT_STATE_UNINITIALIZED, INIT_STATE_INITIALIZING)
+        if not won:
+            # A freshly created segment is zero-filled by the OS, so this cannot
+            # happen unless the mapping is not what the platform reported.
+            self._fail("Newly created shared memory segment is already initialized")
+        self._set_geometry(capacity, control_size)
+        self._write_header_and_control()
+        self._build_atomics()
+        self._a_init.store_release(INIT_STATE_READY)
+
+    def _fail(self, message: str) -> None:
+        """Release the mapping and raise - construction failed after mapping."""
+        self._release_mappings()
+        raise RuntimeError(message)
+
+    def _require_mapped_size(self, required: int) -> None:
+        """Raise unless the mapping holds at least `required` bytes.
+
+        A segment this process did not create can be any size, so every header
+        read must be size-checked before it happens (C++ require_mapped_size).
+        """
+        mapped = len(self._buf)
+        if mapped < required:
+            self._fail(f"Shared memory segment is too small - need {required} bytes "
+                       f"but mapped {mapped}")
+
+    def _stale_segment_message(self, state: int) -> str:
+        """Explain a segment that never reached READY and name the recovery step.
+
+        Nothing portable tells a creator that is still working from one that
+        died mid-initialization - a stamped PID is meaningless across PID
+        namespaces and unreliable under PID reuse - so recovery is deliberately
+        an explicit call to remove() (C++ stale_segment_message).
+        """
+        recovery = (" Once no process is using it, clear it with "
+                    f"SlickStreamBuffer.remove(\"{self.name}\") and construct again.")
+        if state == INIT_STATE_INITIALIZING:
+            return (f"Shared memory segment '{self.name}' is stuck in the INITIALIZING "
+                    "state - a creator died part-way through initializing it." + recovery)
+        return (f"Timed out waiting for shared memory '{self.name}' to be initialized - "
+                "the segment exists but no SlickStreamBuffer creator ever initialized it, "
+                "so it may belong to another application." + recovery)
+
+    def _wait_for_ready(self) -> None:
+        """Wait for the creator to publish INIT_STATE_READY, raising if it never
+        arrives (matches C++ wait_for_shared_memory_ready).
+
+        Fails fast when the magic slot already holds a foreign value: a
+        SlickStreamBuffer creator only ever writes HEADER_MAGIC there, so
+        anything else non-zero means the name collides with another
+        application's segment. The caller must have size-checked the header.
+
+        The 2-second limit is a real wall-clock deadline: counting 1 ms sleeps
+        would stretch it by an order of magnitude wherever the OS timer
+        granularity rounds them up (~15.6 ms on Windows).
+        """
+        deadline = time.monotonic() + 2.0
+        while True:
             if self._a_init.load_acquire() == INIT_STATE_READY:
-                return True
+                return
+            observed = struct.unpack_from("<I", self._buf, HEADER_MAGIC_OFFSET)[0]
+            if observed != 0 and observed != HEADER_MAGIC:
+                self._fail("Shared memory header magic mismatch - not a SlickStreamBuffer segment")
+            if time.monotonic() >= deadline:
+                self._fail(self._stale_segment_message(self._a_init.load_acquire()))
             time.sleep(0.001)
-        return False
 
     def _map_existing(self, expected_capacity: Optional[int],
                       expected_control_size: Optional[int]) -> None:
-        """Adopt geometry from the segment header
-        (matches C++ map_existing, stream_buffer.hpp:579-610).
+        """Adopt geometry from the segment header (matches C++ map_existing).
 
         Geometry always comes from the header, never from the mapped size:
-        Windows rounds mappings up to allocation granularity.
+        Windows rounds mappings up to allocation granularity. The mapping must
+        still be large enough to hold what the header declares, or the control
+        and data slices would run off the end of it.
         """
         buf = self._buf
+        self._require_mapped_size(HEADER_SIZE)
+
         magic = struct.unpack_from("<I", buf, HEADER_MAGIC_OFFSET)[0]
         if magic != HEADER_MAGIC:
-            self._release_shm_on_error()
-            raise RuntimeError("Shared memory header magic mismatch - not a SlickStreamBuffer segment")
+            self._fail("Shared memory header magic mismatch - not a SlickStreamBuffer segment")
 
         capacity = struct.unpack_from("<Q", buf, CAPACITY_OFFSET)[0]
         control_size = struct.unpack_from("<I", buf, CONTROL_SIZE_OFFSET)[0]
         if not _is_power_of_two(capacity) or not _is_power_of_two(control_size):
-            self._release_shm_on_error()
-            raise RuntimeError("Shared memory geometry is invalid")
+            self._fail("Shared memory geometry is invalid")
+
+        # The power-of-two checks above bound both values, so a bogus header
+        # geometry cannot wrap the sum past the mapped size.
+        if _total_bytes(capacity, control_size) > len(buf):
+            self._fail("Shared memory segment is smaller than the geometry its header declares")
 
         if expected_capacity is not None and (
                 capacity != expected_capacity or control_size != expected_control_size):
-            self._release_shm_on_error()
-            raise RuntimeError(
+            self._fail(
                 f"Shared memory geometry mismatch. Expected capacity {expected_capacity}"
                 f"/control_size {expected_control_size} but got {capacity}/{control_size}")
 
@@ -357,12 +532,30 @@ class SlickStreamBuffer:
         # C++ loads these relaxed; acquire is stronger and equally correct
         self._committed_cursor = self._a_committed.load_acquire()
         self._consumed_cursor = self._a_consumed.load_acquire()
+        self._next_seq_cursor = self._a_next_seq.load_acquire()
+        self._reserve_end_cursor = self._a_reserve_end.load_acquire()
 
-    def _release_shm_on_error(self) -> None:
-        """Best-effort cleanup when construction fails after mapping."""
-        if self._a_init is not None:
-            self._a_init.release()
-            self._a_init = None
+    def _release_mappings(self) -> None:
+        """Drop every reference into the buffer and close the mapping.
+
+        Shared by close() and the construction-failure path: a SharedMemory
+        cannot be closed while exported memoryviews still reference it.
+        """
+        for attr in ('_a_committed', '_a_consumed', '_a_next_seq',
+                     '_a_reserve_end', '_a_init'):
+            wrapper = getattr(self, attr, None)
+            if wrapper is not None:
+                try:
+                    wrapper.release()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+        for slot in self._a_slot_seq:
+            try:
+                slot.release()
+            except Exception:
+                pass
+        self._a_slot_seq = []
         self._buf = None
         if self._shm is not None:
             try:
@@ -371,6 +564,49 @@ class SlickStreamBuffer:
             except Exception:
                 pass
             self._shm = None
+
+    @staticmethod
+    def remove(name: str) -> bool:
+        """Unlink a shared memory segment by name - the stale-segment recovery
+        step, mirroring C++ ``stream_buffer::remove()``.
+
+        A creator that dies part-way through initializing a segment leaves it
+        stuck in the INITIALIZING state, and on POSIX the name outlives the
+        process, so every later creator and opener fails construction with a
+        message naming this call. The same call clears a stale but fully
+        initialized segment left behind by a crashed producer, which would
+        otherwise be attached with its dead cursors intact. Typically called
+        once at startup, before creating::
+
+            SlickStreamBuffer.remove("my_stream")
+            buf = SlickStreamBuffer(capacity=1 << 20, control_size=4096,
+                                    name="my_stream")
+
+        Returns:
+            True if the segment was removed (always True on Windows).
+
+        Warning:
+            Only call this when no process is using the segment. On POSIX the
+            name is unlinked immediately, so the next creator gets a fresh
+            segment while any process still mapped to the old one keeps reading
+            the orphaned copy. On Windows this is a no-op returning True - a
+            section there disappears once the last handle closes.
+        """
+        if name.startswith('/'):
+            name = name[1:]
+        if sys.platform == 'win32':
+            return True
+        try:
+            from _posixshmem import shm_unlink
+        except ImportError:  # pragma: no cover - POSIX always has it
+            return False
+        prefixed = '/' + name
+        try:
+            shm_unlink(prefixed)
+        except OSError:  # not there, or not ours to unlink
+            return False
+        _retract_shm_registration(prefixed)
+        return True
 
     # ------------------------------------------------------------------
     # Queries
@@ -394,8 +630,10 @@ class SlickStreamBuffer:
     def loss_count(self) -> int:
         """Count of records skipped by this instance due to overwrite.
 
-        Note: always counted in Python; the C++ side counts only when
-        SLICK_STREAM_BUFFER_ENABLE_LOSS_DETECTION is enabled (debug default).
+        Counts only reads made with a traits whose ``count_loss`` is true - so
+        0 under the default :class:`read_traits`, exactly as in C++. Records are
+        still skipped correctly either way; only the counter is silent. Pass
+        :class:`counting_read_traits` to ``read()`` when diagnosing loss.
         """
         return self._loss_count
 
@@ -403,7 +641,7 @@ class SlickStreamBuffer:
         """Get the initial reading cursor for a late-joining consumer.
 
         A consumer starting at this cursor only sees records published after
-        the call. (Matches C++ stream_buffer.hpp:296-298.)
+        the call.
         """
         return self._a_next_seq.load_acquire()
 
@@ -430,7 +668,7 @@ class SlickStreamBuffer:
 
         May relocate the committed-but-unconsumed region to keep it contiguous
         when the ring wraps; memoryviews previously returned by data() or
-        prepare() are invalidated. (Matches C++ stream_buffer.hpp:313-348.)
+        prepare() are invalidated.
 
         The returned view is zero-copy: write into it (e.g. sock.recv_into)
         then call commit().
@@ -478,7 +716,7 @@ class SlickStreamBuffer:
     def commit(self, n: int) -> None:
         """Move n bytes from the prepared region into the committed (readable)
         region. n is clamped to the size of the prepared region; any remainder
-        stays prepared. (Matches C++ stream_buffer.hpp:355-363.)"""
+        stays prepared."""
         if n > self._prepared_size:
             n = self._prepared_size
         self._committed_cursor += n
@@ -488,11 +726,17 @@ class SlickStreamBuffer:
     def consume(self, n: int) -> PublishedRecord:
         """Publish the first n committed bytes to consumers as ONE message
         record. n is clamped to size(); a zero-length consume publishes
-        nothing. (Matches C++ stream_buffer.hpp:373-401.)
+        nothing.
 
         Returns:
             The record as consumers will see it (sequence, data copy, length),
             or a falsy record (data is None) if nothing was published.
+
+        Raises:
+            ValueError: if the clamped length does not fit a record's 32-bit
+                length field (a single message must be < 4 GiB). The check runs
+                before any state changes, so nothing is published and the bytes
+                stay readable - publish them as several smaller records instead.
         """
         avail = self._committed_cursor - self._consumed_cursor
         if n > avail:  # clamp like flat_buffer
@@ -500,13 +744,18 @@ class SlickStreamBuffer:
         if n == 0:
             return PublishedRecord()
         if n > U32_MAX:
-            raise ValueError("a single message must be < 4 GiB")
+            # A record's length field is 32 bits. Truncating here would publish
+            # a wrong length and hand consumers a short read of a long message.
+            raise ValueError("SlickStreamBuffer.consume exceeds the 4 GiB record limit")
 
         # Advance next_seq_ BEFORE publishing the record so that every live
         # record always has seq < next_seq_ (consumers use seq >= next_seq_
-        # to detect reset()).
-        seq = self._a_next_seq.load_acquire()
-        self._a_next_seq.store_release((seq + 1) & U64_MASK)
+        # to detect reset()). The value comes from the producer-private shadow:
+        # only the producer writes it, so re-loading the shared atomic would
+        # just risk a miss on a line consumers keep pulling.
+        seq = self._next_seq_cursor
+        self._next_seq_cursor = (seq + 1) & U64_MASK
+        self._a_next_seq.store_release(self._next_seq_cursor)
 
         i = seq & self._control_mask
         slot = CONTROL_OFFSET + i * RECORD_SIZE
@@ -530,8 +779,7 @@ class SlickStreamBuffer:
         without publishing them.
 
         Use this when the byte stream is interrupted mid-message (e.g. a
-        websocket disconnect after a partial read). (Matches C++
-        stream_buffer.hpp:417-422.)
+        websocket disconnect after a partial read).
         """
         self._committed_cursor = self._consumed_cursor
         self._a_committed.store_release(self._committed_cursor)
@@ -539,8 +787,7 @@ class SlickStreamBuffer:
 
     def data(self) -> memoryview:
         """Read-only view of the committed-but-unconsumed region (always
-        contiguous). Invalidated by the next prepare(). (Matches C++
-        stream_buffer.hpp:427-429.)"""
+        contiguous). Invalidated by the next prepare()."""
         do = self._data_offset
         pos = self._consumed_cursor & self._mask
         return self._buf[do + pos: do + pos + self.size()].toreadonly()
@@ -553,26 +800,36 @@ class SlickStreamBuffer:
     # Consumer side (lock-free)
     # ------------------------------------------------------------------
 
-    def read(self, cursor: int) -> Tuple[Optional[bytes], int, int]:
+    def read(self, cursor: int,
+             traits: type = read_traits) -> Tuple[Optional[bytes], int, int]:
         """Read the next published message.
 
         Python has no by-reference ints, so unlike C++ the updated cursor is
         returned: ``data, length, cursor = buf.read(cursor)``.
 
+        Args:
+            cursor: this consumer's reading cursor (record sequence number).
+            traits: per-call configuration, see :class:`read_traits`. Its
+                defaults resynchronize after a ``reset()`` but do not
+                accumulate ``loss_count()``; subclass to change that.
+
         Returns:
             (data, length, new_cursor) - data is None when no message is
-            available. Lost (overwritten) records are skipped automatically
-            and counted in loss_count().
-
-        (Matches C++ stream_buffer.hpp:448-492.)
+            available. Lost (overwritten) records are always skipped; they are
+            added to loss_count() only when ``traits.count_loss`` is true.
         """
+        detect_reset = traits.detect_reset
+        count_loss = traits.count_loss
         while True:
             i = cursor & self._control_mask
             slot = CONTROL_OFFSET + i * RECORD_SIZE
             seq = self._a_slot_seq[i].load_acquire()
 
-            if seq != K_INVALID_SEQ and seq >= self._a_next_seq.load_acquire():
-                # the buffer has been reset
+            if detect_reset and seq != K_INVALID_SEQ and \
+                    seq >= self._a_next_seq.load_acquire():
+                # A published seq is always < next_seq_, so seq >= next_seq_ can
+                # only mean reset() restarted the numbering under a consumer
+                # that was idle at the time.
                 cursor = 0
                 continue
 
@@ -582,7 +839,8 @@ class SlickStreamBuffer:
 
             if seq > cursor:
                 # producer lapped the control ring; skip to the record in this slot
-                self._loss_count += seq - cursor
+                if count_loss:
+                    self._loss_count += seq - cursor
                 cursor = seq
 
             # fields are ordered by the acquire load of seq
@@ -595,7 +853,8 @@ class SlickStreamBuffer:
             # a plain Python subtraction can go negative and silently invert
             # the verdict.
             if ((self._a_reserve_end.load_acquire() - offset) & U64_MASK) > self._capacity:
-                self._loss_count += 1
+                if count_loss:
+                    self._loss_count += 1
                 cursor = (cursor + 1) & U64_MASK
                 continue
 
@@ -610,8 +869,6 @@ class SlickStreamBuffer:
             (data, length) or (None, 0) if none is available. May transiently
             return (None, 0) while the newest record is being published or
             after it has been lapped.
-
-        (Matches C++ stream_buffer.hpp:501-517.)
         """
         next_seq = self._a_next_seq.load_acquire()
         if next_seq == 0:
@@ -635,8 +892,8 @@ class SlickStreamBuffer:
         """Reset the buffer, invalidating all existing data.
 
         Not thread-safe: call only when no other threads or processes are
-        accessing the buffer. (Matches C++ stream_buffer.hpp:525-542; same
-        store order, with next_seq_ zeroed last.)
+        accessing the buffer. (Same store order as C++, with next_seq_ zeroed
+        last.)
         """
         for i in range(self._control_size):
             off = CONTROL_OFFSET + i * RECORD_SIZE
@@ -648,6 +905,8 @@ class SlickStreamBuffer:
         self._a_next_seq.store_release(0)
         self._committed_cursor = 0
         self._consumed_cursor = 0
+        self._next_seq_cursor = 0
+        self._reserve_end_cursor = 0
         self._prepared_size = 0
         self._loss_count = 0
 
@@ -656,48 +915,35 @@ class SlickStreamBuffer:
 
         For shared memory mode: releases all references to avoid 'exported
         pointers exist' errors. For local memory mode: releases the local
-        buffer. Does not unlink the segment (see unlink()).
+        buffer. Does not delete the segment (see unlink() and remove()).
         """
-        try:
-            for attr in ('_a_committed', '_a_consumed', '_a_next_seq',
-                         '_a_reserve_end', '_a_init'):
-                wrapper = getattr(self, attr, None)
-                if wrapper is not None:
-                    wrapper.release()
-                setattr(self, attr, None)
-
-            if self._a_slot_seq:
-                for slot in self._a_slot_seq:
-                    slot.release()
-            self._a_slot_seq = []
-
-            self._buf = None
-
-            if self.use_shm and self._shm:
-                try:
-                    # prevent "Exception ignored in: SharedMemory.__del__"
-                    # when exported memoryviews still exist
-                    self._shm._mmap = None
-                    self._shm.close()
-                    self._shm = None
-                except Exception:
-                    pass
-
-            if not self.use_shm and self._local_buf:
-                self._local_buf = None
-        except Exception as e:
-            print(e)
+        self._release_mappings()
+        self._local_buf = None
 
     def unlink(self) -> None:
-        """Unlink (delete) the shared memory segment.
+        """Unlink (delete) the shared memory segment this instance is attached to.
 
         Only applicable for shared memory mode; no-op for local memory mode.
+        Use :meth:`remove` instead to clear a segment by name without attaching
+        to it - the stale-segment recovery step.
+
+        Valid after :meth:`close`, which is the documented ``shared_memory``
+        idiom - close every handle, then unlink the name once. Deleting a name
+        never touches mappings that already exist, open or closed, so this is
+        the same by-name operation ``remove()`` performs and carries the same
+        caveat: it deletes whatever holds the name now. Routing both through
+        ``remove()`` also keeps one rule for the resource tracker, which cares
+        about what this *process* registered, not which instance asked.
+        Unlinking twice is a no-op, as is unlinking a segment never attached.
         """
         if not self.use_shm:
             return
+        prefixed = self._shm_name
+        if prefixed is None:
+            return
+        self._shm_name = None  # unlink once, however many times this is called
         try:
-            if self._shm:
-                self._shm.unlink()
+            self.remove(prefixed)
         except Exception:
             pass
 
@@ -714,11 +960,14 @@ class SlickStreamBuffer:
 
     def _bump_reserve_end(self, end: int) -> None:
         """Monotonic max - a re-prepare with a smaller n must not move the
-        high-water back. (Matches C++ stream_buffer.hpp:545-550; single
-        producer, so the non-atomic read-modify-write is safe.)"""
-        if self._a_reserve_end.load_acquire() < end:
-            self._a_reserve_end.store_release(end & U64_MASK)
+        high-water back. Compared against the producer-private shadow, so the
+        common no-op case costs no shared load at all."""
+        if self._reserve_end_cursor < end:
+            self._reserve_end_cursor = end & U64_MASK
+            self._a_reserve_end.store_release(self._reserve_end_cursor)
 
 
-__all__ = ["SlickStreamBuffer", "PublishedRecord", "__version__",
-           "HEADER_MAGIC", "K_INVALID_SEQ"]
+__all__ = ["SlickStreamBuffer", "PublishedRecord",
+           "read_traits", "counting_read_traits",
+           "ReadTraits", "CountingReadTraits",
+           "__version__", "HEADER_MAGIC", "K_INVALID_SEQ"]

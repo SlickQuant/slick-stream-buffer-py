@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.21)
 project(slick_stream_buffer_py_interop_tests)
 
 set(CMAKE_CXX_STANDARD 20)

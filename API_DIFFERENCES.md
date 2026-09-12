@@ -1,8 +1,8 @@
 # API Differences: Python vs C++
 
 The Python implementation is binary-compatible with the C++ `slick::SlickStreamBuffer`
-at the shared memory level — every byte, offset, and memory ordering matches. The
-*language-level* API differs in the following ways.
+(`slick/stream_buffer.hpp` v2.0.0) at the shared memory level — every byte, offset, and
+memory ordering matches. The *language-level* API differs in the following ways.
 
 ## Construction
 
@@ -11,8 +11,15 @@ at the shared memory level — every byte, offset, and memory ordering matches. 
 | `stream_buffer buf(capacity, control_size)` | `SlickStreamBuffer(capacity=..., control_size=...)` |
 | `stream_buffer buf(capacity, control_size, "name")` | `SlickStreamBuffer(capacity=..., control_size=..., name="name")` |
 | `stream_buffer buf("name")` | `SlickStreamBuffer(name="name")` |
+| `stream_buffer::remove("name")` | `SlickStreamBuffer.remove("name")` (static, returns `bool`) |
 | throws `std::invalid_argument` (bad sizes) | raises `ValueError` |
+| throws `std::length_error` (geometry past the address space) | raises `ValueError` |
 | throws `std::runtime_error` (shm failures) | raises `RuntimeError` (or `FileNotFoundError` when opening a missing segment) |
+
+Both implementations take initialization authority from the OS, not from the in-band
+init-state slot: C++ uses `slick::shm`'s `is_creator()`, Python uses whether
+`SharedMemory(create=True)` succeeded. Both reduce to `O_CREAT|O_EXCL` on POSIX and
+`ERROR_ALREADY_EXISTS` on Windows, so neither ever initializes a segment it did not create.
 
 ## Consumer cursor is passed by value
 
@@ -34,6 +41,31 @@ data, length, cursor = buf.read(cursor)   # updated cursor returned
 `read()` returns `(None, 0, cursor)` where C++ returns `{nullptr, 0}`.
 `read_last()` returns `(None, 0)` / `(bytes, length)`.
 
+## Read traits are a runtime argument, not a template parameter
+
+C++ configures `read()` with a template parameter, so the flags are compile-time constants
+and a misconfiguration cannot cross a translation unit. Python has no equivalent, so the
+same traits class is passed as an ordinary second argument:
+
+```cpp
+// C++
+struct counting : slick::read_traits { static constexpr bool count_loss = true; };
+auto [data, len] = buf.read<counting>(cursor);
+```
+
+```python
+# Python
+from slick_stream_buffer_py import counting_read_traits
+data, length, cursor = buf.read(cursor, counting_read_traits)
+```
+
+The flags and their defaults are identical (`detect_reset = True`, `count_loss = False`),
+and subclassing `read_traits` works the same way as deriving from `slick::read_traits`.
+Python also exports `ReadTraits` / `CountingReadTraits` as PEP 8 spellings of the same two
+classes. The performance argument for making `count_loss` opt-in is a C++ one (~20% of
+`read()` on MSVC); in Python the cost is two attribute lookups per call, but the *semantics*
+match so that `loss_count()` means the same thing on both sides.
+
 ## Zero-copy vs copies
 
 | Operation | C++ | Python |
@@ -52,11 +84,12 @@ Python API safe by default.
 `prepare()`/`data()` memoryviews are invalidated by the next `prepare()` (which may
 relocate the region) — same semantics as C++ flat_buffer-style invalidation.
 
-## prepare() overflow
+## prepare() / consume() overflow
 
-C++ throws `std::length_error` when `size() + n > capacity()`; Python raises
-`ValueError`. C++ `consume()` asserts messages are < 4 GiB (debug builds); Python
-always raises `ValueError`.
+C++ throws `std::length_error` when `size() + n > capacity()`; Python raises `ValueError`.
+`consume()` behaves the same on both sides — a message of 4 GiB or more is rejected before
+any state moves, so nothing is published and the bytes stay readable — but C++ throws
+`std::length_error` and Python raises `ValueError`.
 
 ## consume() return value
 
@@ -66,9 +99,10 @@ published (`data is None`), matching C++ `operator bool`.
 
 ## loss_count()
 
-C++ counts losses only when `SLICK_STREAM_BUFFER_ENABLE_LOSS_DETECTION` is enabled
-(default: debug builds only). Python always counts. The counter is per-instance in
-both implementations, not shared through the segment.
+Identical semantics on both sides: losses are counted only for reads made with a traits
+whose `count_loss` is true, so `loss_count()` reads 0 under the defaults. Records are still
+skipped correctly either way. The counter is per-instance in both implementations, not
+shared through the segment.
 
 ## Memory orderings
 
@@ -84,9 +118,18 @@ release/acquire — strictly stronger, therefore still correct.
 Python adds explicit lifecycle management that C++ handles via RAII:
 
 - `close()` — detach from the segment (does not delete it)
-- `unlink()` — delete the segment (call once, from the owner, after all users closed)
+- `unlink()` — delete the segment this instance is attached to (call once, from the owner,
+  after all users closed - including this instance, so `close()` then `unlink()` is fine)
 - context manager support: `with SlickStreamBuffer(...) as buf: ...` (closes on exit)
 - `get_shm_name()` — the exact segment name to pass to C++ (`/`-prefixed on POSIX)
+
+`remove(name)` is the one lifecycle call both sides share, with the same contract: unlink a
+segment by name without attaching to it, returning `True` on success and, on Windows, always
+`True` because a section dies with its last handle. Python routes it through
+`_posixshmem.shm_unlink`, then drops the name from `multiprocessing`'s resource tracker if -
+and only if - this process is what registered it. A name registered elsewhere stays that
+owner's to account for: the tracker answers an unregister for a name it never saw by raising
+`KeyError` and printing a traceback from its own process.
 
 On POSIX with Python >= 3.13, attaching to an existing segment uses
 `SharedMemory(track=False)` so Python's resource tracker never unlinks a segment the

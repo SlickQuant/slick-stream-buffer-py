@@ -12,7 +12,7 @@ set(SLICK_SHM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     slick-stream-buffer
     GIT_REPOSITORY https://github.com/SlickQuant/slick-stream-buffer.git
-    GIT_TAG main
+    GIT_TAG v2.0.0
 )
 FetchContent_MakeAvailable(slick-stream-buffer)
 
@@ -73,6 +73,12 @@ add_test(
 )
 
 add_test(
+    NAME python_attaches_to_cpp_segment_as_creator
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_interop.py --test python_attaches_to_cpp_segment_as_creator
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+add_test(
     NAME wrap_relocation_interop
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_interop.py --test wrap_relocation_interop
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -91,6 +97,7 @@ set_tests_properties(
     python_producer_cpp_consumer
     cpp_producer_python_consumer
     cpp_creates_python_reads
+    python_attaches_to_cpp_segment_as_creator
     wrap_relocation_interop
     read_last_interop
     PROPERTIES TIMEOUT 120

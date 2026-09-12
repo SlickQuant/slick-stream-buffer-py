@@ -6,6 +6,7 @@ one-for-one (adapted to the Python API: read() returns (data, length, cursor),
 prepare() returns a writable memoryview, and data/record payloads are bytes
 copies rather than pointers).
 """
+import os
 import sys
 import threading
 import time
@@ -13,7 +14,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from slick_stream_buffer_py import SlickStreamBuffer, K_INVALID_SEQ
+from slick_stream_buffer_py import (
+    SlickStreamBuffer,
+    K_INVALID_SEQ,
+    read_traits,
+    counting_read_traits as dbg,
+)
+
+
+class SkipTest(Exception):
+    """Raised by a test that cannot run in this environment."""
+
+# Loss counting is opt-in, and these tests assert on loss_count(), so they read
+# through traits that turn it on - mirroring the `dbg` traits of the C++ suites.
+# Reset resynchronization is on by default; test_default_read_traits_are_silent
+# covers what the defaults do and do not do.
 
 
 def write_bytes(buf: SlickStreamBuffer, data: bytes) -> None:
@@ -34,7 +49,7 @@ def publish_filled(buf: SlickStreamBuffer, value: int, n: int) -> None:
 
 def test_empty_read_returns_none():
     buf = SlickStreamBuffer(capacity=1024, control_size=16)
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is None
     assert length == 0
     assert cursor == 0
@@ -78,12 +93,12 @@ def test_prepare_commit_consume_read_roundtrip():
     assert record.length == 5
     assert record.data == b"hello"
 
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data == b"hello"
     assert length == 5
     assert cursor == 1
 
-    data2, length2, cursor = buf.read(cursor)
+    data2, length2, cursor = buf.read(cursor, dbg)
     assert data2 is None
     assert length2 == 0
     buf.close()
@@ -100,11 +115,11 @@ def test_consume_splits_into_records():
     assert r1.length == 4
     assert r2.length == 6
 
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data == b"0123"
     assert length == 4
 
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"456789"
     assert length == 6
     buf.close()
@@ -167,7 +182,7 @@ def test_consume_more_than_size_clamps():
     assert buf.size() == 0
     assert record.length == 5
 
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is not None
     assert length == 5
     buf.close()
@@ -182,17 +197,17 @@ def test_consume_zero_is_noop():
     assert record.length == 0
     assert buf.size() == 3
 
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is None
     assert length == 0
 
     # empty buffer: consume(0) publishes nothing either
     buf.consume(3)
     buf.consume(0)
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"abc"
     assert length == 3
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data is None
     assert length == 0
     buf.close()
@@ -230,7 +245,7 @@ def test_wrap_relocation_preserves_unconsumed_bytes():
     buf.consume(40)
 
     # read the published record before its bytes get overwritten
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data == src[:40]
     assert length == 40
 
@@ -248,7 +263,7 @@ def test_wrap_relocation_preserves_unconsumed_bytes():
 
     # publish the relocated region as one record and read it back
     buf.consume(40)
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == src[40:80]
     assert length == 40
     assert buf.loss_count() == 0
@@ -261,17 +276,17 @@ def test_records_across_jump_read_in_order():
     publish_filled(buf, ord('A'), 40)   # record 0: ring [0, 40)
 
     # consume record 0 before its ring bytes can be reused
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is not None
     assert length == 40
 
     publish_filled(buf, ord('B'), 16)   # record 1: ring [40, 56)
     publish_filled(buf, ord('C'), 16)   # forces jump (56 + 16 > 64); record 2: ring [0, 16)
 
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"B" * 16
 
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"C" * 16
 
     assert buf.loss_count() == 0
@@ -286,7 +301,7 @@ def test_control_ring_lapping_detects_loss():
         publish_filled(buf, i, 1)
 
     # slots now hold records 4..7; a cursor at 0 must skip to 4 and count the loss
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is not None
     assert length == 1
     assert data[0] == 4
@@ -294,7 +309,7 @@ def test_control_ring_lapping_detects_loss():
     assert cursor == 5
 
     for i in range(5, 8):
-        data, length, cursor = buf.read(cursor)
+        data, length, cursor = buf.read(cursor, dbg)
         assert data is not None
         assert data[0] == i
     buf.close()
@@ -308,13 +323,13 @@ def test_data_ring_lapping_detects_loss():
 
     # record 0 and 1 bytes were overwritten by records 2 and 3; the validity
     # check must skip them
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is not None
     assert length == 32
     assert data[0] == 2
     assert buf.loss_count() == 2
 
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data is not None
     assert data[0] == 3
     buf.close()
@@ -342,14 +357,14 @@ def test_late_joiner_initial_reading_index():
 
     cursor = buf.initial_reading_index()
     assert cursor == 3
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data is None  # nothing new yet
 
     publish_filled(buf, ord('d'), 5)
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"d" * 5
     assert length == 5
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data is None
     buf.close()
 
@@ -366,7 +381,7 @@ def test_multi_consumer_broadcast():
         cursor = 0
         expected = 0
         while received[c] < k_messages:
-            data, length, cursor = buf.read(cursor)
+            data, length, cursor = buf.read(cursor, dbg)
             if data is None:
                 time.sleep(0)  # yield
                 continue
@@ -415,7 +430,7 @@ def test_discard_invalidates_partial_message():
 
     # the published record is still readable because the discarded bytes did
     # not wrap over it
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data == b"complete"
     assert length == 8
 
@@ -424,7 +439,7 @@ def test_discard_invalidates_partial_message():
     assert buf.size() == 5
     assert bytes(buf.data()) == b"fresh"
     buf.consume(5)
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"fresh"
     assert length == 5
     assert buf.loss_count() == 0
@@ -444,7 +459,7 @@ def test_discard_keeps_overwrite_loss_for_lagging_consumers():
     mv[:] = b"X" * 32
     buf.discard()
 
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is None
     assert length == 0
     assert cursor == 1
@@ -452,7 +467,7 @@ def test_discard_keeps_overwrite_loss_for_lagging_consumers():
 
     write_bytes(buf, b"ok")
     buf.consume(2)
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"ok"
     assert length == 2
     buf.close()
@@ -477,7 +492,7 @@ def test_discard_then_refill_across_wrap():
     buf = SlickStreamBuffer(capacity=64, control_size=16)
 
     publish_filled(buf, ord('A'), 40)
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is not None
     assert length == 40
 
@@ -493,7 +508,7 @@ def test_discard_then_refill_across_wrap():
     # refill across the wrap and read every record back intact
     for i in range(4):
         publish_filled(buf, i, 16)
-        data, length, cursor = buf.read(cursor)
+        data, length, cursor = buf.read(cursor, dbg)
         assert data == bytes([i]) * 16
         assert length == 16
     assert buf.loss_count() == 0
@@ -507,7 +522,7 @@ def test_discard_on_empty_buffer_is_noop():
 
     publish_filled(buf, ord('a'), 3)
     buf.discard()  # nothing unconsumed - published record stays readable
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data == b"a" * 3
     assert length == 3
     buf.close()
@@ -526,11 +541,11 @@ def test_reset():
     data, length = buf.read_last()
     assert data is None
 
-    data, length, cursor = buf.read(0)
+    data, length, cursor = buf.read(0, dbg)
     assert data is None
 
     publish_filled(buf, ord('z'), 6)
-    data, length, cursor = buf.read(cursor)
+    data, length, cursor = buf.read(cursor, dbg)
     assert data == b"z" * 6
     assert length == 6
     buf.close()
@@ -538,8 +553,8 @@ def test_reset():
 
 def test_reset_detection_snaps_cursor():
     """White-box: a consumer observing a stale slot from before a reset
-    (seq >= next_seq_) must snap its cursor back to 0
-    (stream_buffer.hpp:453-457)."""
+    (seq >= next_seq_) must snap its cursor back to 0 - read()'s detect_reset
+    branch."""
     buf = SlickStreamBuffer(capacity=1024, control_size=16)
     for _ in range(3):
         publish_filled(buf, ord('a'), 4)
@@ -548,10 +563,120 @@ def test_reset_detection_snaps_cursor():
     # simulate a stale pre-reset slot a mid-reset consumer might observe
     buf._a_slot_seq[5].store_release(7)  # 7 >= next_seq (0)
 
-    data, length, cursor = buf.read(5)
+    data, length, cursor = buf.read(5, dbg)
     assert data is None
     assert cursor == 0, f"cursor must snap to 0 on reset detection, got {cursor}"
     buf.close()
+
+
+def test_default_read_traits_are_silent():
+    """The default read_traits count no loss - a semantic difference, not just a
+    speed one: records are still skipped correctly, but loss_count() stays 0
+    until you read through traits that ask for it. Reset resynchronization, by
+    contrast, is on by default because it measured free in C++."""
+    buf = SlickStreamBuffer(capacity=1024, control_size=4)  # tiny control ring
+    for i in range(8):
+        publish_filled(buf, ord('a') + i, 1)
+
+    data, length, cursor = buf.read(0)  # default traits
+    assert data is not None
+    assert length == 1
+    assert data[0] == ord('e'), "the reader still skips to the oldest surviving record"
+    assert cursor == 5
+    assert buf.loss_count() == 0, "default traits do not accumulate loss_count()"
+    buf.close()
+
+    # the same read with counting enabled reports the four records that were skipped
+    counted = SlickStreamBuffer(capacity=1024, control_size=4)
+    for i in range(8):
+        publish_filled(counted, ord('a') + i, 1)
+    data, _, _ = counted.read(0, dbg)
+    assert data is not None
+    assert counted.loss_count() == 4
+    counted.close()
+
+
+def test_detect_reset_can_be_turned_off():
+    """detect_reset is on by default; traits that turn it off must leave a stale
+    pre-reset slot to be read as an ordinary lapped record rather than snapping
+    the cursor back to 0."""
+    class no_reset_detect(read_traits):
+        detect_reset = False
+
+    buf = SlickStreamBuffer(capacity=1024, control_size=16)
+    for _ in range(3):
+        publish_filled(buf, ord('a'), 4)
+    buf.reset()
+    buf._a_slot_seq[5].store_release(7)  # 7 >= next_seq (0), as in ResetDetection
+
+    data, length, cursor = buf.read(5, no_reset_detect)
+    assert cursor == 8, f"without detect_reset the cursor must not snap to 0, got {cursor}"
+    assert data == b"", "the zeroed record reads as an empty one"
+    assert length == 0
+
+    # the same slot, read with the defaults, snaps back to the start
+    data, length, cursor = buf.read(5, dbg)
+    assert data is None
+    assert cursor == 0
+    buf.close()
+
+
+def test_geometry_beyond_address_space_raises():
+    """A geometry whose total cannot be addressed must be rejected, not truncated
+    into a tiny mapping that would then pass every later size check against its
+    own wrapped value (C++ GeometryBeyondAddressSpaceThrows)."""
+    too_big = 1 << 63  # a valid power of two, past sys.maxsize on any build
+    assert too_big > sys.maxsize
+    for kwargs in (dict(capacity=too_big, control_size=16),
+                   dict(capacity=too_big, control_size=16, name="ssb_py_oversized")):
+        try:
+            SlickStreamBuffer(**kwargs)
+            assert False, f"expected ValueError for {kwargs}"
+        except ValueError as e:
+            assert "address space" in str(e), str(e)
+
+
+def test_consume_beyond_four_gib_raises_instead_of_truncating():
+    """A record's length field is 32 bits, so a message of 4 GiB or more cannot
+    be published. The check runs before any state moves, so nothing is published
+    and the bytes stay readable to go out as several smaller records.
+
+    Needs a 4 GiB ring, so it is opt-in: set SSB_PY_TEST_4GIB=1 to run it.
+    Unlike the C++ test it republishes a small record rather than the largest one
+    that fits, because Python's read()/consume() hand back bytes copies.
+    """
+    if os.environ.get('SSB_PY_TEST_4GIB') != '1':
+        raise SkipTest("set SSB_PY_TEST_4GIB=1 to run the 4 GiB record test")
+    capacity = 1 << 32
+    try:
+        buf = SlickStreamBuffer(capacity=capacity, control_size=16)
+    except MemoryError:
+        raise SkipTest("not enough memory for a 4 GiB ring")
+    try:
+        mv = buf.prepare(capacity)
+        assert len(mv) == capacity
+        mv[:8] = b"leading!"
+        del mv  # release the view before consume() slices the ring again
+        buf.commit(capacity)
+        assert buf.size() == capacity
+
+        try:
+            buf.consume(capacity)
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "4 GiB" in str(e), str(e)
+
+        # nothing was published and no state moved, so the bytes are still there
+        assert buf.size() == capacity
+        assert buf.read(0, dbg)[0] is None
+
+        rec = buf.consume(8)  # publish the front of it as a record that does fit
+        assert rec
+        assert rec.length == 8
+        assert rec.data == b"leading!"
+        assert buf.size() == capacity - 8
+    finally:
+        buf.close()
 
 
 def run_all_tests():
@@ -581,6 +706,11 @@ def run_all_tests():
         ("DiscardOnEmptyBufferIsNoop", test_discard_on_empty_buffer_is_noop),
         ("Reset", test_reset),
         ("ResetDetectionSnapsCursor", test_reset_detection_snaps_cursor),
+        ("DefaultReadTraitsAreSilent", test_default_read_traits_are_silent),
+        ("DetectResetCanBeTurnedOff", test_detect_reset_can_be_turned_off),
+        ("GeometryBeyondAddressSpaceRaises", test_geometry_beyond_address_space_raises),
+        ("ConsumeBeyondFourGiBRaisesInsteadOfTruncating",
+         test_consume_beyond_four_gib_raises_instead_of_truncating),
     ]
 
     print("=" * 70)
@@ -589,6 +719,7 @@ def run_all_tests():
 
     passed = 0
     failed = 0
+    skipped = 0
 
     for name, test_func in tests:
         try:
@@ -596,6 +727,10 @@ def run_all_tests():
             test_func()
             print("[PASSED]")
             passed += 1
+        except SkipTest as e:
+            print("[SKIPPED]")
+            print(f"  {e}")
+            skipped += 1
         except Exception as e:
             print("[FAILED]")
             print(f"  Error: {e}")
@@ -604,7 +739,7 @@ def run_all_tests():
             failed += 1
 
     print("\n" + "=" * 70)
-    print(f"Results: {passed} passed, {failed} failed")
+    print(f"Results: {passed} passed, {failed} failed, {skipped} skipped")
     print("=" * 70)
 
     return failed == 0

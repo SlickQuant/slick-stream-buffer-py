@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from slick_stream_buffer_py import SlickStreamBuffer
+from slick_stream_buffer_py import SlickStreamBuffer, counting_read_traits as dbg
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ def python_read_strict(buf: SlickStreamBuffer, worker_id: int, n_messages: int,
     deadline = time.time() + timeout_s
     while received < n_messages:
         assert time.time() < deadline, f"timed out after {received} messages"
-        data, length, cursor = buf.read(cursor)
+        data, length, cursor = buf.read(cursor, dbg)
         if data is None:
             time.sleep(0)
             continue
@@ -113,7 +113,7 @@ def python_read_lossy(buf: SlickStreamBuffer, worker_id: int, n_messages: int,
     while True:
         assert time.time() < deadline, \
             f"timed out after {received} messages (last msg {last_msg_num})"
-        data, length, cursor = buf.read(cursor)
+        data, length, cursor = buf.read(cursor, dbg)
         if data is None:
             time.sleep(0)
             continue
@@ -299,10 +299,56 @@ def test_read_last_interop():
         _cleanup(buf)
 
 
+def test_python_attaches_to_cpp_segment_as_creator():
+    """C++ creates the segment; Python constructs with the *creator* form and
+    the same geometry. Only the process that actually created a segment may
+    initialize it, so Python must attach to the live one - not claim ownership
+    and not reset the cursors out from under the C++ producer."""
+    print("TEST: C++ creates segment -> Python creator form attaches to it")
+    n = 100
+    worker = 6
+    capacity = 1 << 16
+    control_size = 1024
+    shm_name = "ssb_interop_attach"
+
+    producer = subprocess.Popen(
+        [find_cpp_executable("cpp_producer"), shm_name, str(n), str(worker),
+         "create", str(capacity), str(control_size), "--hold"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = producer.stdout.readline()
+        assert f"PUBLISHED {n}" in line, f"unexpected producer output: {line!r}"
+
+        buf = SlickStreamBuffer(capacity=capacity, control_size=control_size, name=shm_name)
+        try:
+            assert not buf.own_buffer, "Python must not claim a segment C++ created"
+            assert buf.capacity == capacity
+            assert buf.control_size == control_size
+            # The records published before we attached are still there, which
+            # they would not be had the attach reinitialized the segment.
+            assert buf.initial_reading_index() == n, \
+                f"next_seq_ was reset: {buf.initial_reading_index()} != {n}"
+            python_read_strict(buf, worker, n)
+            print(f"  Python attached without reinitializing and read all {n} messages")
+        finally:
+            buf.close()
+    finally:
+        try:
+            producer.stdin.write("exit\n")
+            producer.stdin.flush()
+        except Exception:
+            pass
+        try:
+            producer.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            producer.kill()
+
+
 ALL_TESTS = {
     "python_producer_cpp_consumer": test_python_producer_cpp_consumer,
     "cpp_producer_python_consumer": test_cpp_producer_python_consumer,
     "cpp_creates_python_reads": test_cpp_creates_python_reads,
+    "python_attaches_to_cpp_segment_as_creator": test_python_attaches_to_cpp_segment_as_creator,
     "wrap_relocation_interop": test_wrap_relocation_interop,
     "read_last_interop": test_read_last_interop,
 }

@@ -23,7 +23,7 @@ correctness; the (theoretical) performance difference is irrelevant in Python.
 """
 from __future__ import annotations
 
-__version__ = '0.1.0'
+__version__ = '2.0.0'
 
 import sys
 import struct
@@ -476,7 +476,7 @@ class AtomicUInt32:
     def compare_exchange(self, expected: int, desired: int) -> Tuple[bool, int]:
         """
         Atomic compare-and-swap (strong, acq_rel on success) matching the C++
-        init_state handshake (stream_buffer.hpp:663-665).
+        init_state handshake.
 
         Returns:
             Tuple of (success: bool, actual: int)
