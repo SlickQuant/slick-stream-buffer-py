@@ -1,6 +1,6 @@
 # Changelogs
 
-## [v2.0.0] - 2026-09-09
+## [v2.0.0] - 2026-09-12
 
 Matches C++ [slick-stream-buffer v2.0.0](https://github.com/SlickQuant/slick-stream-buffer/blob/main/CHANGELOG.md).
 The version number jumps from 0.1.0 to 2.0.0 so that the Python package and the C++ header it
