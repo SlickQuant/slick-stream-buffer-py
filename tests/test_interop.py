@@ -192,6 +192,10 @@ def test_cpp_creates_python_reads():
     capacity = 1 << 16
     control_size = 1024
     shm_name = "ssb_interop_cppcreate"
+    # C++ v2.1.0 leaves a segment it created in place when it exits, so this test
+    # deletes the name itself: first anything an interrupted run left, then its
+    # own segment once the producer is gone.
+    SlickStreamBuffer.remove(shm_name)
 
     producer = subprocess.Popen(
         [find_cpp_executable("cpp_producer"), shm_name, str(n), str(worker),
@@ -222,6 +226,8 @@ def test_cpp_creates_python_reads():
             producer.wait(timeout=30)
         except subprocess.TimeoutExpired:
             producer.kill()
+            producer.wait()
+        SlickStreamBuffer.remove(shm_name)
 
 
 def test_wrap_relocation_interop():
@@ -310,6 +316,10 @@ def test_python_attaches_to_cpp_segment_as_creator():
     capacity = 1 << 16
     control_size = 1024
     shm_name = "ssb_interop_attach"
+    # C++ v2.1.0 leaves a segment it created in place when it exits, so this test
+    # deletes the name itself: first anything an interrupted run left, then its
+    # own segment once the producer is gone.
+    SlickStreamBuffer.remove(shm_name)
 
     producer = subprocess.Popen(
         [find_cpp_executable("cpp_producer"), shm_name, str(n), str(worker),
@@ -342,6 +352,8 @@ def test_python_attaches_to_cpp_segment_as_creator():
             producer.wait(timeout=30)
         except subprocess.TimeoutExpired:
             producer.kill()
+            producer.wait()
+        SlickStreamBuffer.remove(shm_name)
 
 
 ALL_TESTS = {

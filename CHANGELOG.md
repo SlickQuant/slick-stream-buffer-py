@@ -1,5 +1,63 @@
 # Changelogs
 
+## [v2.1.0] - 2026-10-17
+
+Matches C++ [slick-stream-buffer v2.1.0](https://github.com/SlickQuant/slick-stream-buffer/blob/main/CHANGELOG.md):
+no buffer removes its shared-memory segment on its own any more, and `remove_shm()` is how the
+coordinating process does. The shared memory format is unchanged (`SSB1`), so 2.0 and 2.1
+processes in either language can share a segment.
+
+### Segment lifetime (behavior change)
+- On POSIX, a segment is no longer unlinked when the process that created it exits.
+  `SharedMemory(create=True)` registered it with `multiprocessing`'s resource tracker, which
+  unlinks what is registered when the process exits, so a producer that exited first stranded
+  every consumer still attached on an orphaned mapping, while its restart silently created a
+  fresh segment under the same name that those consumers never saw. C++ v2.1.0 stopped its
+  destructor doing the same. A name now lives until `unlink()`, `remove_shm()` or
+  `remove(name)`, and a restarted process reattaches to the existing segment and keeps its
+  contents. Windows is unaffected: a section dies with its last handle.
+- The buffer sends the resource tracker nothing at all: `track=False` on Python 3.13+, and on
+  older POSIX Pythons a `SharedMemory` subclass that maps the segment without registering it.
+  The 2.0.0 bookkeeping of which names this process had registered is gone, and `remove()` no
+  longer contacts the tracker.
+- Migration: code that relied on the cleanup at exit now leaves segments in `/dev/shm`, and its
+  next run attaches to them - `own_buffer` is `False`, reading resumes from the old cursors, and
+  a creator with a different geometry raises `RuntimeError` ("geometry mismatch"). Call
+  `remove(name)` at startup for a clean start, or `unlink()` / `remove_shm()` at shutdown once
+  no peer will attach again.
+
+### Added
+- `remove_shm() -> bool`, matching C++: unlinks this buffer's segment name so the next creator
+  starts fresh, leaving open mappings - this buffer's own included - valid. It unlinks by name
+  on every call, where `unlink()` runs once, and leaves `unlink()` nothing to do afterwards, so a
+  later `unlink()` cannot delete a replacement created under the name. Returns `False` for a
+  local-memory buffer or when the name is already gone, and always `True` for a shared buffer on
+  Windows. C++ v2.1.0's
+  other addition, `shm_name()`, is the existing `get_shm_name()` (`None` rather than `""` for a
+  local-memory buffer).
+
+### Fixed
+- Before Python 3.13 on POSIX, a process that only attached to a segment unlinked it when it
+  exited, because attaching registered the name with that process's resource tracker too.
+  2.0.0 avoided this only on 3.13+, through `track=False`.
+
+### Tests
+- Segment lifetime: `unlink()` repeated, `remove_shm()` on local and shared buffers, `unlink()`
+  after `remove_shm()` sparing a replacement segment, a
+  creator's and an attacher's exit in a fresh interpreter, no resource-tracker traffic at all,
+  a child forked while another thread is constructing a buffer, and spawned children attaching
+  at once. A test that `remove()` leaves the tracker alone for this process's own segment
+  replaces the 2.0.0 one that it retracted the registration.
+- The interop tests build against C++ slick-stream-buffer `v2.1.0` (was `v2.0.0`). The two in
+  which C++ creates the segment remove it before starting and after the producer exits, since
+  C++ now leaves it in place; a rerun used to attach to the previous run's segment.
+- Tests that hand-build a raw segment open it through the library's opener, so that handle and
+  the buffer no longer both claim the name in the resource tracker.
+
+Checked against C++ slick-stream-buffer v2.1.0 with the interop tests on Windows and on Linux,
+run three times on Linux so a segment left behind would fail a rerun, and on Linux under
+Python 3.12 (the subclass) and 3.14 (`track=False`).
+
 ## [v2.0.0] - 2026-09-12
 
 Matches C++ [slick-stream-buffer v2.0.0](https://github.com/SlickQuant/slick-stream-buffer/blob/main/CHANGELOG.md).

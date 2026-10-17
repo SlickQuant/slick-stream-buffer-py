@@ -5,9 +5,15 @@ Mirrors the C++ test suite in slick-stream-buffer/tests/stream_buffer_shm_tests.
 plus Python-specific regressions (geometry from header despite Windows
 mapping-size rounding, cross-process broadcast via multiprocessing).
 """
+import os
+import signal
 import struct
+import subprocess
 import sys
+import tempfile
+import threading
 import time
+import warnings
 import multiprocessing
 from multiprocessing import shared_memory, resource_tracker, Process, Queue
 from pathlib import Path
@@ -188,7 +194,9 @@ def test_geometry_mismatch_raises():
 def test_magic_mismatch_raises():
     """A segment that claims to be ready but has the wrong magic must be rejected."""
     _unlink_raw("ssb_py_bad_magic")
-    raw = shared_memory.SharedMemory(name="ssb_py_bad_magic", create=True, size=4096)
+    # Through the library's own opener, so this raw handle and the buffer below do
+    # not both claim the name in the resource tracker before Python 3.13
+    raw = ssb._open_shm("ssb_py_bad_magic", create=True, size=4096)
     try:
         struct.pack_into("<I", raw.buf, 44, 0xDEADBEEF)  # header magic slot
         struct.pack_into("<I", raw.buf, 48, 3)           # INIT_STATE_READY
@@ -198,15 +206,8 @@ def test_magic_mismatch_raises():
         except RuntimeError as e:
             assert "magic mismatch" in str(e), str(e)
     finally:
-        try:
-            raw._mmap = None
-            raw.close()
-        except Exception:
-            pass
-        try:
-            raw.unlink()
-        except Exception:
-            pass
+        _close_raw(raw)
+        SlickStreamBuffer.remove("ssb_py_bad_magic")
 
 
 def test_open_nonexistent_raises():
@@ -559,11 +560,10 @@ def test_unlink_after_close_removes_segment():
     """Regression: unlink() used to be a silent no-op once close() had run,
     because close() drops the SharedMemory object it went through - so the
     documented shared_memory idiom, close every handle then unlink the name
-    once, left the segment and its tracker registration behind on POSIX."""
+    once, left the segment behind on POSIX."""
     name = "ssb_py_unlink_after_close"
     _unlink_raw(name)
     buf = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
-    prefixed = buf.get_shm_name()
     buf.close()
     buf.unlink()
 
@@ -572,10 +572,24 @@ def test_unlink_after_close_removes_segment():
         assert False, "the segment outlived unlink()"
     except FileNotFoundError:
         pass
-    assert prefixed not in ssb._tracked_shm_names, \
-        "unlink() left the segment registered with the resource tracker"
 
-    buf.unlink()  # unlinking twice is a no-op, not a second unlink by name
+
+def test_unlink_twice_is_noop():
+    """A repeated unlink() must not delete a segment a later run created under
+    the same name."""
+    name = "ssb_py_unlink_twice"
+    _unlink_raw(name)
+    first = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    first.close()
+    first.unlink()
+
+    second = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    try:
+        assert second.own_buffer
+        first.unlink()
+        SlickStreamBuffer(name=name).close()  # still there
+    finally:
+        _cleanup(second)
 
 
 def test_remove_does_not_unregister_unknown_name():
@@ -603,42 +617,283 @@ def test_remove_does_not_unregister_unknown_name():
         "remove() told the tracker about a name this process never registered"
 
 
-def test_remove_retracts_own_registration():
-    """The other half of the rule: a segment this process created is registered
-    with the tracker on POSIX, so remove()ing it by name must retract that
-    registration - the tracker would otherwise warn at exit and try to unlink a
-    name that is already gone."""
+def test_remove_leaves_tracker_alone_for_own_segment():
+    """A buffer never leaves its segment registered with the resource tracker,
+    so remove()ing one this process created has nothing to retract either."""
     name = "ssb_py_own_reg"
     _unlink_raw(name)
     buf = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
-    prefixed = buf.get_shm_name()  # None once closed, so read it while attached
     buf.close()
 
     calls = []
     original = resource_tracker.unregister
-
-    def spy(n, rtype):
-        calls.append((n, rtype))
-        original(n, rtype)  # really retract it - the tracker holds this one
-
-    resource_tracker.unregister = spy
+    resource_tracker.unregister = lambda n, rtype: calls.append((n, rtype))
     try:
         assert SlickStreamBuffer.remove(name) is True
     finally:
         resource_tracker.unregister = original
+    assert calls == [], calls
 
-    expected = [] if sys.platform == 'win32' else [(prefixed, "shared_memory")]
-    assert calls == expected, calls
-    assert prefixed not in ssb._tracked_shm_names
 
-    # And only once: the name is gone from the registry, so a second remove()
-    # has nothing left to retract.
-    resource_tracker.unregister = spy
+def test_remove_shm_local_buffer_returns_false():
+    buf = SlickStreamBuffer(capacity=1024, control_size=16)
     try:
-        SlickStreamBuffer.remove(name)
+        assert buf.remove_shm() is False
     finally:
-        resource_tracker.unregister = original
-    assert calls == expected, calls
+        buf.close()
+
+
+def test_remove_shm_keeps_open_mapping_valid():
+    name = "ssb_py_remove_shm"
+    _unlink_raw(name)
+    buf = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    try:
+        publish_message(buf, b"before")
+        assert buf.remove_shm() is True
+        # The mapping outlives its name
+        publish_message(buf, b"after")
+        data, _, cursor = buf.read(0, dbg)
+        assert data == b"before"
+        data, _, _ = buf.read(cursor, dbg)
+        assert data == b"after"
+
+        if sys.platform != 'win32':
+            # The next creator starts fresh rather than reattaching
+            assert buf.remove_shm() is False  # already gone
+            fresh = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+            try:
+                assert fresh.own_buffer
+                assert fresh.read(0, dbg)[0] is None
+            finally:
+                _cleanup(fresh)
+    finally:
+        _cleanup(buf)
+
+
+# A fresh interpreter, so it has its own resource tracker - a multiprocessing
+# child would share the parent's, and the parent's exit would be what unlinked
+# the name.
+_LIFETIME_CHILD = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from slick_stream_buffer_py import SlickStreamBuffer
+name, mode, payload = sys.argv[2], sys.argv[3], sys.argv[4].encode()
+if mode == 'create':
+    buf = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    assert buf.own_buffer, "child expected to create the segment"
+else:
+    buf = SlickStreamBuffer(name=name)
+mv = buf.prepare(len(payload))
+mv[:] = payload
+buf.commit(len(payload))
+buf.consume(len(payload))
+buf.close()
+"""
+
+
+def _run_lifetime_child(name: str, mode: str, payload: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _LIFETIME_CHILD, str(Path(__file__).parent.parent),
+         name, mode, payload],
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"child failed:\n{result.stdout}\n{result.stderr}"
+    # The tracker warns about every registered name it cleans up at shutdown
+    assert "resource_tracker" not in result.stderr, result.stderr
+
+
+def test_creator_exit_keeps_segment():
+    """A creator's exit used to unlink the name on POSIX through the resource
+    tracker, stranding any peer on an orphaned mapping (C++ v2.1.0 stopped its
+    destructor doing the same). On Windows a section dies with its last handle,
+    which no one else holds here."""
+    if sys.platform == 'win32':
+        return
+    name = "ssb_py_creator_exit"
+    _unlink_raw(name)
+    _run_lifetime_child(name, 'create', "from child")
+    buf = SlickStreamBuffer(name=name)
+    try:
+        assert buf.read(0, dbg)[0] == b"from child"
+        # A restarted creator reattaches and keeps the contents
+        again = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+        try:
+            assert not again.own_buffer
+        finally:
+            again.close()
+    finally:
+        _cleanup(buf)
+
+
+def test_attacher_exit_keeps_segment():
+    """Before Python 3.13 attaching registered the name with the attacher's
+    resource tracker too, so any peer's exit unlinked the segment on POSIX."""
+    name = "ssb_py_attacher_exit"
+    _unlink_raw(name)
+    buf = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    try:
+        _run_lifetime_child(name, 'open', "first")
+        _run_lifetime_child(name, 'open', "second")
+        reopened = SlickStreamBuffer(name=name)
+        try:
+            data, _, cursor = reopened.read(0, dbg)
+            assert data == b"first"
+            assert reopened.read(cursor, dbg)[0] == b"second"
+        finally:
+            reopened.close()
+    finally:
+        _cleanup(buf)
+
+
+def test_unlink_after_remove_shm_spares_replacement():
+    """Regression: remove_shm() left unlink()'s pending name in place, so once the
+    old segment was removed and a replacement created under the same name, the
+    old buffer's unlink() deleted the replacement. Also when remove_shm() finds
+    the name already gone, since a replacement can take it just the same."""
+    name = "ssb_py_rm_unlink"
+    for gone_first in (False, True):
+        SlickStreamBuffer.remove(name)
+        old = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+        try:
+            if gone_first:
+                SlickStreamBuffer.remove(name)  # someone else got there first
+                assert old.remove_shm() is (sys.platform == 'win32')
+            else:
+                assert old.remove_shm() is True
+            replacement = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+            try:
+                if sys.platform != 'win32':
+                    assert replacement.own_buffer
+                old.unlink()
+                SlickStreamBuffer(name=name).close()  # still there
+            finally:
+                _cleanup(replacement)
+        finally:
+            old.close()
+
+
+def test_never_talks_to_resource_tracker():
+    """No REGISTER or UNREGISTER for a buffer's segment reaches
+    multiprocessing's resource tracker - not on create, attach, close or
+    unlink. Before Python 3.13 the library registered each name and then
+    retracted it at once, which raced between processes sharing one tracker
+    and needed a lock that a fork could leave held (see the two tests below)."""
+    name = "ssb_py_no_tracker"
+    SlickStreamBuffer.remove(name)
+    calls = []
+    orig_register, orig_unregister = resource_tracker.register, resource_tracker.unregister
+    resource_tracker.register = lambda n, rtype: calls.append(("register", n))
+    resource_tracker.unregister = lambda n, rtype: calls.append(("unregister", n))
+    try:
+        creator = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+        opener = SlickStreamBuffer(name=name)
+        second = SlickStreamBuffer(capacity=1024, control_size=16, name=name)  # attaches
+        for buf in (second, opener, creator):
+            buf.close()
+        creator.unlink()
+    finally:
+        resource_tracker.register, resource_tracker.unregister = orig_register, orig_unregister
+        SlickStreamBuffer.remove(name)
+    assert calls == [], calls
+
+
+def test_fork_during_construction_does_not_deadlock():
+    """A child forked while another thread is constructing a buffer can still
+    construct one. Python < 3.13 held a module lock around SharedMemory() for
+    the tracker fallback, and a fork inside that window handed the child a copy
+    of the lock that nothing would ever release, so its next construction hung."""
+    if not hasattr(os, 'fork'):
+        return
+    name = "ssb_py_fork"
+    SlickStreamBuffer.remove(name)
+    keeper = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    stop = threading.Event()
+
+    def churn():
+        while not stop.is_set():
+            SlickStreamBuffer(name=name).close()
+
+    thread = threading.Thread(target=churn, daemon=True)
+    thread.start()
+    try:
+        with warnings.catch_warnings():
+            # Python 3.12+ warns about forking a multi-threaded process
+            warnings.simplefilter("ignore", DeprecationWarning)
+            for attempt in range(20):
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        SlickStreamBuffer(name=name).close()
+                    except BaseException:
+                        os._exit(1)
+                    os._exit(0)
+                deadline = time.monotonic() + 5
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        raise AssertionError(
+                            f"forked child {attempt} hung constructing a buffer")
+                    time.sleep(0.01)
+                assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, \
+                    f"forked child {attempt} failed (status {status})"
+    finally:
+        stop.set()
+        thread.join()
+        _cleanup(keeper)
+
+
+_RELATED_PROCESSES_SCRIPT = r"""
+import multiprocessing
+import sys
+sys.path.insert(0, sys.argv[1])
+from slick_stream_buffer_py import SlickStreamBuffer
+
+
+def churn(name, n):
+    for _ in range(n):
+        SlickStreamBuffer(name=name).close()
+
+
+if __name__ == '__main__':
+    name = sys.argv[2]
+    SlickStreamBuffer.remove(name)
+    buf = SlickStreamBuffer(capacity=1024, control_size=16, name=name)
+    ctx = multiprocessing.get_context('spawn')
+    procs = [ctx.Process(target=churn, args=(name, 200)) for _ in range(4)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    buf.close()
+    buf.unlink()
+    # Every worker must succeed: max() let a killed one's negative code hide
+    # behind any worker that exited 0
+    codes = [p.exitcode for p in procs]
+    if codes != [0] * len(procs):
+        sys.exit(f"worker exit codes: {codes}")
+"""
+
+
+def test_related_processes_do_not_race_in_tracker():
+    """multiprocessing children share their parent's resource tracker, so
+    before Python 3.13 two of them attaching at once could send REGISTER,
+    REGISTER, UNREGISTER, UNREGISTER and make the tracker print a KeyError
+    traceback. The tracker writes to the stderr it inherited, so the scenario
+    runs in a fresh interpreter whose stderr this test captures. A spawned
+    child re-imports the script by path, hence a file rather than -c."""
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "related_processes.py"
+        script.write_text(_RELATED_PROCESSES_SCRIPT)
+        result = subprocess.run(
+            [sys.executable, str(script), str(Path(__file__).parent.parent),
+             "ssb_py_related"],
+            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"script failed:\n{result.stdout}\n{result.stderr}"
+    assert "KeyError" not in result.stderr, result.stderr
+    assert "resource_tracker" not in result.stderr, result.stderr
 
 
 def test_stale_cursor_after_reset_resynchronizes_via_shm():
@@ -654,7 +909,7 @@ def test_stale_cursor_after_reset_resynchronizes_via_shm():
 
         client = SlickStreamBuffer(name=name)
 
-        raw = shared_memory.SharedMemory(name=client.get_shm_name().lstrip('/'), create=False)
+        raw = ssb._open_shm(client.get_shm_name().lstrip('/'), create=False)
         try:
             slot = HEADER_SIZE + 3 * RECORD_SIZE          # control_[3]
             struct.pack_into("<Q", raw.buf, slot + 8, 0)  # offset -> record 0's bytes
@@ -696,8 +951,21 @@ def run_all_tests():
         ("RemoveClearsWedgedSegment", test_remove_clears_wedged_segment),
         ("RemoveMissingSegmentIsHarmless", test_remove_missing_segment_is_harmless),
         ("UnlinkAfterCloseRemovesSegment", test_unlink_after_close_removes_segment),
+        ("UnlinkTwiceIsNoop", test_unlink_twice_is_noop),
         ("RemoveDoesNotUnregisterUnknownName", test_remove_does_not_unregister_unknown_name),
-        ("RemoveRetractsOwnRegistration", test_remove_retracts_own_registration),
+        ("RemoveLeavesTrackerAloneForOwnSegment",
+         test_remove_leaves_tracker_alone_for_own_segment),
+        ("RemoveShmLocalBufferReturnsFalse", test_remove_shm_local_buffer_returns_false),
+        ("RemoveShmKeepsOpenMappingValid", test_remove_shm_keeps_open_mapping_valid),
+        ("CreatorExitKeepsSegment", test_creator_exit_keeps_segment),
+        ("AttacherExitKeepsSegment", test_attacher_exit_keeps_segment),
+        ("UnlinkAfterRemoveShmSparesReplacement",
+         test_unlink_after_remove_shm_spares_replacement),
+        ("NeverTalksToResourceTracker", test_never_talks_to_resource_tracker),
+        ("ForkDuringConstructionDoesNotDeadlock",
+         test_fork_during_construction_does_not_deadlock),
+        ("RelatedProcessesDoNotRaceInTracker",
+         test_related_processes_do_not_race_in_tracker),
         ("StaleCursorAfterResetResynchronizesViaShm",
          test_stale_cursor_after_reset_resynchronizes_via_shm),
     ]

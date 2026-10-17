@@ -7,7 +7,7 @@ a lock-free single-producer multi-consumer (SPMC) byte stream buffer with shared
 consumer (or vice versa) communicate seamlessly through the same shared memory segment, using
 the same `std::atomic` synchronization primitives.
 
-Tracks C++ `slick/stream_buffer.hpp` **v2.0.0** (header magic `'SSB1'`); the two carry the same
+Tracks C++ `slick/stream_buffer.hpp` **v2.1.0** (header magic `'SSB1'`); the two carry the same
 version number. The shared memory format is unchanged from v1.x, so a segment written by an
 older process is still readable.
 
@@ -171,13 +171,28 @@ On POSIX `remove()` unlinks immediately: the next creator gets a fresh segment, 
 process still mapped to the old one keeps reading the orphaned copy. On Windows it is a no-op
 returning `True` - a section there disappears once the last handle closes.
 
-One Python-only caveat: on POSIX before Python 3.13, `multiprocessing`'s resource tracker
-unlinks every segment the process mapped when it exits, including ones it only attached to.
-Python 3.13+ attaches with `SharedMemory(track=False)`, which is why 3.13 or newer is
-recommended when several processes share a segment. `remove()` unlinks the segment either way,
-and retracts the tracker's registration only when this process is the one that registered it -
-a name registered by some other process, or by a `SharedMemory` you built yourself, stays that
-owner's to account for. See [API_DIFFERENCES.md](API_DIFFERENCES.md).
+No buffer deletes its segment on its own: not `close()`, not the context manager, and not
+process exit, matching C++ v2.1.0. On POSIX, a departing process that unlinked the name while a
+peer was still attached would leave that peer reading an orphaned mapping while a restarted
+producer silently created a fresh segment under the same name, so the two never met again.
+Instead, the process that coordinates the buffer's lifetime deletes the name once no peer will
+attach again, with `unlink()` or `remove_shm()` on an instance, or `remove(name)`:
+
+```python
+# Coordinator, after every peer has shut down
+buf.close()
+buf.unlink()    # once; a repeat is a no-op, so it cannot delete a later run's segment
+```
+
+`remove_shm()` is the C++-style call: it unlinks by name on every call and returns `bool`, and
+open mappings, including this instance's own, stay valid. Until the name is deleted, a restarted
+process reattaches to the existing segment and keeps its contents.
+
+Buffers keep their segments out of `multiprocessing`'s resource tracker, which would otherwise
+unlink them when the process exits - before Python 3.13, even in a process that only attached.
+They send the tracker nothing at all: `track=False` on Python 3.13+, and on older POSIX Pythons a
+`SharedMemory` subclass that maps the segment without registering it. See
+[API_DIFFERENCES.md](API_DIFFERENCES.md).
 
 ### Shared memory layout
 
@@ -213,7 +228,8 @@ Total segment size: `64 + 32 * control_size + capacity`.
 | `initial_reading_index()` | consumer | cursor for a late joiner (skips history) |
 | `loss_count()` | consumer | records skipped by this instance, counting only reads made with `count_loss` traits |
 | `reset()` | owner | clear all state (not thread-safe) |
-| `close()` / `unlink()` | lifecycle | detach / delete this instance's segment |
+| `close()` / `unlink()` | lifecycle | detach / delete this instance's segment (once, valid after `close()`) |
+| `remove_shm() -> bool` | lifecycle | unlink this instance's segment name, as C++ `remove_shm()` |
 | `SlickStreamBuffer.remove(name)` | lifecycle | unlink a segment by name - the stale-segment recovery step |
 
 See [API_DIFFERENCES.md](API_DIFFERENCES.md) for the exact deviations from the C++ API

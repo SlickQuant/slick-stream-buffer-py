@@ -1,7 +1,7 @@
 # API Differences: Python vs C++
 
 The Python implementation is binary-compatible with the C++ `slick::SlickStreamBuffer`
-(`slick/stream_buffer.hpp` v2.0.0) at the shared memory level — every byte, offset, and
+(`slick/stream_buffer.hpp` v2.1.0) at the shared memory level — every byte, offset, and
 memory ordering matches. The *language-level* API differs in the following ways.
 
 ## Construction
@@ -119,19 +119,28 @@ Python adds explicit lifecycle management that C++ handles via RAII:
 
 - `close()` — detach from the segment (does not delete it)
 - `unlink()` — delete the segment this instance is attached to (call once, from the owner,
-  after all users closed - including this instance, so `close()` then `unlink()` is fine)
+  after all users closed - including this instance, so `close()` then `unlink()` is fine).
+  A repeat is a no-op, so it cannot delete a segment a later run created under the same name
 - context manager support: `with SlickStreamBuffer(...) as buf: ...` (closes on exit)
-- `get_shm_name()` — the exact segment name to pass to C++ (`/`-prefixed on POSIX)
+- `get_shm_name()` — the exact segment name to pass to C++ (`/`-prefixed on POSIX); C++
+  `shm_name()` returns `""` for a local-memory buffer where Python returns `None`
+
+Neither side deletes a segment on its own, matching C++ v2.1.0: not the C++ destructor, and not
+Python's `close()`, context manager or process exit. `remove_shm()` is shared with the same
+contract: unlink this buffer's segment name, on every call, leaving open mappings valid, and
+return `False` for a local-memory buffer.
 
 `remove(name)` is the one lifecycle call both sides share, with the same contract: unlink a
 segment by name without attaching to it, returning `True` on success and, on Windows, always
 `True` because a section dies with its last handle. Python routes it through
-`_posixshmem.shm_unlink`, then drops the name from `multiprocessing`'s resource tracker if -
-and only if - this process is what registered it. A name registered elsewhere stays that
-owner's to account for: the tracker answers an unregister for a name it never saw by raising
-`KeyError` and printing a traceback from its own process.
+`_posixshmem.shm_unlink` and never sends the resource tracker an unregister: the tracker answers
+one for a name it does not hold by raising `KeyError` and printing a traceback from its own
+process.
 
-On POSIX with Python >= 3.13, attaching to an existing segment uses
-`SharedMemory(track=False)` so Python's resource tracker never unlinks a segment the
-process does not own. On older Pythons the tracker may log a harmless warning at exit
-(see `tests/run_test.py`, which filters it).
+Python keeps every segment it creates or attaches to out of `multiprocessing`'s resource tracker,
+which would otherwise unlink it when the process exits, and sends the tracker nothing at all:
+`SharedMemory(track=False)` on Python 3.13+, and on older POSIX Pythons a `SharedMemory` subclass
+that maps the segment without registering it. Registering and retracting at once instead would
+race between processes sharing one tracker - `multiprocessing` children share their parent's -
+and need a lock that a fork could leave held. A `SharedMemory` you open yourself is still tracked
+unless you pass `track=False` (Python 3.13+).

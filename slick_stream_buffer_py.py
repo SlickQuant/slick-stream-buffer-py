@@ -50,15 +50,17 @@ Caveats (same as C++):
 """
 from __future__ import annotations
 
-__version__ = '2.0.0'
+__version__ = '2.1.0'
 
+import os
 import sys
 import time
+import mmap
 import struct
 import ctypes
 import inspect
 from multiprocessing.shared_memory import SharedMemory
-from typing import Optional, Set, Tuple, Union
+from typing import Optional, Tuple, Union
 
 from ssb_atomic_ops import AtomicUInt64, AtomicUInt32
 
@@ -88,46 +90,79 @@ K_INVALID_SEQ = 0xFFFFFFFFFFFFFFFF
 U64_MASK = 0xFFFFFFFFFFFFFFFF
 U32_MAX = 0xFFFFFFFF
 
-# Python >= 3.13 supports SharedMemory(track=False) to opt out of the
-# resource tracker's exit-time auto-unlink when merely attaching on POSIX.
+# Python >= 3.13 supports SharedMemory(track=False), which keeps a segment out of
+# multiprocessing's resource tracker.
 _SHM_SUPPORTS_TRACK = 'track' in inspect.signature(SharedMemory.__init__).parameters
 
-# Tracker-form ('/name') segments this process actually registered with
-# multiprocessing's resource tracker, and so is entitled to unregister. The
-# tracker services UNREGISTER with set.remove() on its own cache, so handing it
-# a name it never saw makes it raise KeyError and print an asynchronous
-# traceback from its own process - and merely sending the message starts that
-# process if it was not already running. Under the GIL set.add() and
-# set.remove() are atomic, so the registry needs no lock: exactly one caller
-# wins the name and does the retracting.
-_tracked_shm_names: Set[str] = set()
+if not _SHM_SUPPORTS_TRACK and sys.platform != 'win32':
+    import _posixshmem
+
+    class _UntrackedSharedMemory(SharedMemory):
+        """``SharedMemory(track=False)`` for POSIX Python < 3.13, where that
+        argument does not exist.
+
+        The base class touches the resource tracker in exactly two places, and
+        only those are replaced: ``__init__``, which registers the name, and
+        ``unlink()``, which unregisters it. This ``__init__`` sets the same
+        attributes the base one does, which ``close()``, ``buf``, ``name``,
+        ``size``, ``__del__`` and ``__reduce__`` rely on.
+
+        Sending the tracker nothing at all is what makes this safe. Registering
+        and then retracting at once needed a lock against other threads, which a
+        fork could leave held in the child, and still raced against other
+        processes sharing the tracker - multiprocessing children share their
+        parent's - which answers an UNREGISTER for a name it no longer holds by
+        printing a KeyError traceback.
+        """
+
+        def __init__(self, name: str, create: bool = False, size: int = 0):
+            flags = os.O_RDWR
+            if create:
+                if size <= 0:
+                    raise ValueError("'size' must be a positive number different from zero")
+                flags |= os.O_CREAT | os.O_EXCL
+            self._name = '/' + name
+            self._fd = _posixshmem.shm_open(self._name, flags, mode=self._mode)
+            try:
+                if create:
+                    os.ftruncate(self._fd, size)
+                size = os.fstat(self._fd).st_size
+                self._mmap = mmap.mmap(self._fd, size)
+            except OSError:
+                os.close(self._fd)
+                self._fd = -1
+                if create:  # only a segment this call made is ours to delete
+                    try:
+                        _posixshmem.shm_unlink(self._name)
+                    except OSError:
+                        pass
+                raise
+            self._size = size
+            self._buf = memoryview(self._mmap)
+
+        def unlink(self) -> None:
+            if self._name:
+                _posixshmem.shm_unlink(self._name)
 
 
-def _note_shm_registration(shm: SharedMemory) -> None:
-    """Record that constructing ``shm`` registered its name with the resource
-    tracker, so a later unlink can retract exactly what we registered."""
-    if sys.platform != 'win32':
-        _tracked_shm_names.add(shm._name)
+def _open_shm(name: str, create: bool, size: int = 0) -> SharedMemory:
+    """Create or attach to a segment without registering it with
+    multiprocessing's resource tracker.
 
-
-def _retract_shm_registration(prefixed: str) -> None:
-    """Drop this process's resource-tracker registration for a segment that is
-    already unlinked, so exiting does not warn about cleaning up a name that is
-    gone.
-
-    Silent when this process never registered the name - the usual case for the
-    startup ``remove()`` call, where the segment belongs to a previous run and
-    telling the tracker about it would only make it raise.
+    A registered name is unlinked by the tracker when the process exits, which on
+    POSIX is the lifetime C++ slick-stream-buffer v2.1.0 dropped: a peer still
+    attached keeps reading the orphaned mapping while a restarted producer
+    silently creates a fresh segment under the same name, so the two never meet
+    again. Python before 3.13 registers on attach as well as on create, so any
+    peer's exit removed the segment. The name now outlives every process until
+    remove_shm(), unlink() or remove() is called. Windows has no tracker; a
+    section there dies with its last handle.
     """
-    try:
-        _tracked_shm_names.remove(prefixed)
-    except KeyError:
-        return  # never ours to retract - leave the tracker alone
-    try:
-        from multiprocessing import resource_tracker
-        resource_tracker.unregister(prefixed, "shared_memory")
-    except Exception:
-        pass
+    if _SHM_SUPPORTS_TRACK:
+        return SharedMemory(name=name, create=create, size=size, track=False)
+    if sys.platform == 'win32':
+        return SharedMemory(name=name, create=create, size=size)
+    return _UntrackedSharedMemory(name, create, size)
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -365,17 +400,6 @@ class SlickStreamBuffer:
         struct.pack_into("<I", self._buf, INIT_STATE_OFFSET, INIT_STATE_READY)
         self._build_atomics()
 
-    @staticmethod
-    def _attach_shm(name: str) -> SharedMemory:
-        """Attach to an existing segment without registering it with the
-        POSIX resource tracker (Python >= 3.13), so an attaching process
-        exiting does not unlink a segment it does not own."""
-        if _SHM_SUPPORTS_TRACK and sys.platform != 'win32':
-            return SharedMemory(name=name, create=False, track=False)
-        shm = SharedMemory(name=name, create=False)
-        _note_shm_registration(shm)  # older Python registers even on attach
-        return shm
-
     def _adopt_shm(self, shm: SharedMemory) -> None:
         """Take over a mapping: hold the object, map its bytes, and remember
         its name. The name is kept separately because close() drops the object
@@ -397,7 +421,7 @@ class SlickStreamBuffer:
         """
         if open_only:
             # Opener constructor - open existing only
-            self._adopt_shm(self._attach_shm(self.name))
+            self._adopt_shm(_open_shm(self.name, create=False))
             self._a_init = AtomicUInt32(self._buf, INIT_STATE_OFFSET)
             self._require_mapped_size(HEADER_SIZE)
             self._wait_for_ready()
@@ -407,11 +431,10 @@ class SlickStreamBuffer:
         # Creator constructor - create or open (C++ open_or_create)
         total = _total_bytes(capacity, control_size)
         try:
-            shm = SharedMemory(name=self.name, create=True, size=total)
-            _note_shm_registration(shm)
+            shm = _open_shm(self.name, create=True, size=total)
             created = True
         except FileExistsError:
-            shm = self._attach_shm(self.name)
+            shm = _open_shm(self.name, create=False)
             created = False
         self._adopt_shm(shm)
         self._a_init = AtomicUInt32(self._buf, INIT_STATE_OFFSET)
@@ -596,16 +619,17 @@ class SlickStreamBuffer:
             name = name[1:]
         if sys.platform == 'win32':
             return True
+        # Straight to shm_unlink rather than SharedMemory.unlink(), which before
+        # Python 3.13 also retracts a tracker registration this module never keeps -
+        # see _open_shm().
         try:
             from _posixshmem import shm_unlink
         except ImportError:  # pragma: no cover - POSIX always has it
             return False
-        prefixed = '/' + name
         try:
-            shm_unlink(prefixed)
+            shm_unlink('/' + name)
         except OSError:  # not there, or not ours to unlink
             return False
-        _retract_shm_registration(prefixed)
         return True
 
     # ------------------------------------------------------------------
@@ -927,14 +951,18 @@ class SlickStreamBuffer:
         Use :meth:`remove` instead to clear a segment by name without attaching
         to it - the stale-segment recovery step.
 
+        No buffer ever does this on its own - not close(), not the context
+        manager and not process exit - so call it from the process that
+        coordinates the buffer's lifetime, once no peer will attach again.
+
         Valid after :meth:`close`, which is the documented ``shared_memory``
         idiom - close every handle, then unlink the name once. Deleting a name
         never touches mappings that already exist, open or closed, so this is
         the same by-name operation ``remove()`` performs and carries the same
-        caveat: it deletes whatever holds the name now. Routing both through
-        ``remove()`` also keeps one rule for the resource tracker, which cares
-        about what this *process* registered, not which instance asked.
-        Unlinking twice is a no-op, as is unlinking a segment never attached.
+        caveat: it deletes whatever holds the name now. Unlinking twice is a
+        no-op, as is unlinking a segment never attached, so a repeat cannot
+        delete a segment a later run has since created under the same name;
+        :meth:`remove_shm` is the C++-style call that unlinks on every call.
         """
         if not self.use_shm:
             return
@@ -946,6 +974,29 @@ class SlickStreamBuffer:
             self.remove(prefixed)
         except Exception:
             pass
+
+    def remove_shm(self) -> bool:
+        """Unlink this buffer's segment name so the next creator starts fresh.
+        Matches C++ ``remove_shm()``.
+
+        Mappings that are already open, including this buffer's own, stay valid
+        until they are closed. Unlike :meth:`unlink` it unlinks by name on every
+        call, so it deletes whatever holds the name at the time.
+
+        After this call :meth:`unlink` is a no-op, whatever the result: a name
+        removed here, or one already gone, can be taken by a replacement segment,
+        which the pending unlink() would otherwise delete.
+
+        Returns:
+            True if the name was removed; False for a local-memory buffer or if
+            removal failed (on POSIX, typically because the name is already
+            gone). Always True for a shared buffer on Windows, where the segment
+            is freed when its last handle closes.
+        """
+        if not self.use_shm:
+            return False
+        self._shm_name = None  # unlink() is done with this name - see above
+        return self.remove(self.name)
 
     def __enter__(self):
         return self
